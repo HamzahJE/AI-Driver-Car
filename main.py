@@ -14,7 +14,7 @@ from modules.openai_vision import get_driving_command
 # ============================================================================
 # SERIAL CONFIG — adjust port to match your Pi's serial device
 # ============================================================================
-SERIAL_PORT = '/dev/ttyUSB0'   # Common for USB-connected Arduino on Pi
+SERIAL_PORT = '/dev/ttyACM0'   # Arduino on Pi
 BAUD_RATE = 115200
 LOOP_INTERVAL = 1.0            # Seconds between each capture-decide-send cycle
 
@@ -23,6 +23,7 @@ def open_serial(port=SERIAL_PORT, baud=BAUD_RATE):
     """Open serial connection to the Arduino."""
     ser = serial.Serial(port, baud, timeout=1)
     time.sleep(2)  # Wait for Arduino to reset after serial connection
+    ser.reset_input_buffer()  # Flush the "Robot Ready..." startup message
     print(f"[serial] Connected to Arduino on {port} @ {baud}")
     return ser
 
