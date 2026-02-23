@@ -2,6 +2,7 @@ import time
 import sys
 import os
 import serial
+import threading
 from dotenv import load_dotenv
 
 # Load environment variables once at startup
@@ -16,7 +17,6 @@ from modules.openai_vision import get_driving_command
 # ============================================================================
 SERIAL_PORT = '/dev/ttyACM0'   # Arduino on Pi
 BAUD_RATE = 115200
-MOVE_DURATION = 0.5            # Seconds to drive before stopping and re-evaluating
 
 
 def open_serial(port=SERIAL_PORT, baud=BAUD_RATE):
@@ -28,58 +28,84 @@ def open_serial(port=SERIAL_PORT, baud=BAUD_RATE):
     return ser
 
 
-def send_command(ser, command):
-    """Send a single-character command (F/B/L/R/S) to the Arduino and wait for ACK."""
-    ser.write(command.encode())
+def send_goal(ser, goal):
+    """Send a goal direction (F/B/L/R/S) to the Arduino."""
+    ser.reset_input_buffer()  # Clear any queued sensor data before sending
+    ser.write(goal.encode())
     time.sleep(0.05)
     ack = ser.read(1).decode(errors='ignore')
     if ack == 'A':
-        print(f"[arduino] ACK for '{command}'")
+        print(f"[arduino] ACK — goal set to '{goal}'")
     elif ack == 'E':
-        print(f"[arduino] ERROR — unrecognised command '{command}'")
+        print(f"[arduino] ERROR — unrecognised command '{goal}'")
     else:
-        print(f"[arduino] No response (got '{ack}')")
+        print(f"[arduino] No ACK (got '{ack}')")
+
+
+def sensor_logger(ser, stop_event):
+    """Background thread: read and display sensor data from Arduino."""
+    while not stop_event.is_set():
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode(errors='ignore').strip()
+                if line.startswith('D:'):
+                    # D:front_cm
+                    print(f"[sensor] Front: {line[2:]}cm")
+            else:
+                time.sleep(0.02)
+        except Exception:
+            time.sleep(0.1)
 
 
 def main():
-    """Main loop: stop → capture → ask LLM → move briefly → repeat."""
+    """Main loop: Arduino drives continuously, Pi sends updated direction goals."""
     ser = open_serial()
 
+    # Start background sensor logging
+    stop_event = threading.Event()
+    sensor_thread = threading.Thread(target=sensor_logger, args=(ser, stop_event), daemon=True)
+    sensor_thread.start()
+
     print("[main] Starting AI driving loop  (Ctrl-C to stop)")
-    print(f"[main] Move duration: {MOVE_DURATION}s per command\n")
+    print("[main] Arduino handles real-time driving. Pi sends direction goals.\n")
+
+    # Start with stop until first LLM decision
+    send_goal(ser, 'S')
+
     try:
         while True:
-            # 1. STOP the car while we think — prevents hitting walls
-            send_command(ser, 'S')
-
-            # 2. Capture an image while stationary
+            # 1. Capture image (Arduino keeps driving the current goal)
             print("[cam] Capturing image...")
             try:
                 capture_image()
             except Exception as e:
-                print(f"[cam] ERROR: {e} — staying stopped")
+                print(f"[cam] ERROR: {e} — setting goal to S")
+                send_goal(ser, 'S')
+                time.sleep(1)
                 continue
 
-            # 3. Ask LLM which direction to go
+            # 2. Ask LLM for direction (Arduino still driving)
             print("[llm] Asking for driving command...")
             try:
-                command = get_driving_command()  # returns one of F, B, L, R, S
+                goal = get_driving_command()
             except Exception as e:
-                print(f"[llm] ERROR: {e} — staying stopped")
+                print(f"[llm] ERROR: {e} — setting goal to S")
+                send_goal(ser, 'S')
+                time.sleep(1)
                 continue
 
-            # 4. Execute the command for a short burst, then loop back to stop
-            if command in ('F', 'B', 'L', 'R', 'S'):
-                print(f"[llm] Decision: {command}")
-                send_command(ser, command)
-                if command != 'S':
-                    time.sleep(MOVE_DURATION)  # Drive for a brief moment
+            # 3. Update the Arduino's goal direction
+            if goal in ('F', 'B', 'L', 'R', 'S'):
+                print(f"[llm] New goal: {goal}")
+                send_goal(ser, goal)
             else:
-                print(f"[llm] Unexpected response '{command}' — staying stopped")
+                print(f"[llm] Unexpected '{goal}' — setting goal to S")
+                send_goal(ser, 'S')
 
     except KeyboardInterrupt:
-        print("\n[main] Stopping — sending S (stop)")
-        send_command(ser, 'S')
+        print("\n[main] Stopping...")
+        send_goal(ser, 'S')
+        stop_event.set()
         ser.close()
         sys.exit(0)
 
