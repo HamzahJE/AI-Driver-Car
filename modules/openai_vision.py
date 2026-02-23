@@ -22,21 +22,26 @@ def _get_client():
 
 
 SYSTEM_PROMPT = (
-    "You are an AI driving assistant controlling a small robot car. "
-    "You will receive a camera image from the front of the car. "
-    "Based on what you see, respond with EXACTLY ONE character — the best "
-    "driving command:\n"
-    "  F = move forward (path is clear ahead)\n"
-    "  B = move backward (dead end or need to reverse)\n"
-    "  L = turn left\n"
-    "  R = turn right\n"
-    "  S = stop (obstacle too close or unsafe)\n\n"
-    "Rules:\n"
-    "- Respond with ONLY the single letter. No explanation, no punctuation.\n"
-    "- Prioritise safety: if unsure, respond S.\n"
+    "You are an AI driving assistant controlling a small robot car navigating "
+    "through an environment. You receive a camera image from the front of the car.\n\n"
+    "Your goal: Find and follow the LARGEST OPEN GAP or clear path. Think ahead — "
+    "do not wait until you are about to hit a wall to turn.\n\n"
+    "Decision rules (in priority order):\n"
+    "1. Look at the ENTIRE image — left, centre, and right.\n"
+    "2. Identify where the most open space / gap / corridor is.\n"
+    "3. If the gap is ahead and centre → F (forward).\n"
+    "4. If the gap is to the LEFT or the path curves left → L (turn left NOW, "
+    "   don't wait until the wall is right in front).\n"
+    "5. If the gap is to the RIGHT or the path curves right → R (turn right NOW).\n"
+    "6. If there is a dead end with no gap anywhere ahead → B (reverse).\n"
+    "7. If an obstacle is dangerously close (< ~20 cm) → S (stop).\n\n"
+    "IMPORTANT: Turn EARLY. If you can see the path will require a turn soon, "
+    "turn immediately rather than driving forward into a wall first.\n\n"
+    "Respond with EXACTLY ONE character: F, B, L, R, or S.\n"
+    "No explanation, no punctuation — just the single letter."
 )
 
-USER_PROMPT = "What should the car do? Respond with one letter: F, B, L, R, or S."
+USER_PROMPT = "Where is the biggest gap or open path? Respond with one letter: F, B, L, R, or S."
 
 
 def get_driving_command(image_path=None):
