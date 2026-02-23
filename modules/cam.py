@@ -10,15 +10,17 @@ def capture_image():
 
     image_path = os.path.join(folder, "image.jpg")
 
-    # Use libcamera-still for Pi camera module (CSI)
+    # Use rpicam-still for Pi camera module (CSI)
+    # Small image = faster base64 encode + faster LLM processing
     result = subprocess.run(
         [
-            'libcamera-still',
+            'rpicam-still',
             '-o', image_path,
-            '--width', '640',
-            '--height', '480',
+            '--width', '320',
+            '--height', '240',
             '--nopreview',
-            '-t', '500',        # 500ms exposure/warmup time
+            '-t', '100',        # 100ms — minimal warmup since car is stopped
+            '-q', '50',         # Lower JPEG quality for smaller payload
         ],
         capture_output=True,
         text=True,
@@ -26,7 +28,7 @@ def capture_image():
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"libcamera-still failed: {result.stderr.strip()}")
+        raise RuntimeError(f"rpicam-still failed: {result.stderr.strip()}")
 
     if not os.path.isfile(image_path):
         raise RuntimeError("Image file was not created")

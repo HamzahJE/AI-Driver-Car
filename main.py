@@ -16,7 +16,7 @@ from modules.openai_vision import get_driving_command
 # ============================================================================
 SERIAL_PORT = '/dev/ttyACM0'   # Arduino on Pi
 BAUD_RATE = 115200
-LOOP_INTERVAL = 1.0            # Seconds between each capture-decide-send cycle
+MOVE_DURATION = 0.5            # Seconds to drive before stopping and re-evaluating
 
 
 def open_serial(port=SERIAL_PORT, baud=BAUD_RATE):
@@ -42,41 +42,40 @@ def send_command(ser, command):
 
 
 def main():
-    """Main loop: capture → ask LLM → send direction to Arduino."""
+    """Main loop: stop → capture → ask LLM → move briefly → repeat."""
     ser = open_serial()
 
-    print("[main] Starting AI driving loop  (Ctrl-C to stop)\n")
+    print("[main] Starting AI driving loop  (Ctrl-C to stop)")
+    print(f"[main] Move duration: {MOVE_DURATION}s per command\n")
     try:
         while True:
-            # 1. Capture an image from the Pi camera
+            # 1. STOP the car while we think — prevents hitting walls
+            send_command(ser, 'S')
+
+            # 2. Capture an image while stationary
             print("[cam] Capturing image...")
             try:
                 capture_image()
             except Exception as e:
-                print(f"[cam] ERROR: {e} — sending S (stop)")
-                send_command(ser, 'S')
-                time.sleep(LOOP_INTERVAL)
+                print(f"[cam] ERROR: {e} — staying stopped")
                 continue
 
-            # 2. Ask LLM which direction to go
+            # 3. Ask LLM which direction to go
             print("[llm] Asking for driving command...")
             try:
                 command = get_driving_command()  # returns one of F, B, L, R, S
             except Exception as e:
-                print(f"[llm] ERROR: {e} — sending S (stop)")
-                send_command(ser, 'S')
-                time.sleep(LOOP_INTERVAL)
+                print(f"[llm] ERROR: {e} — staying stopped")
                 continue
 
-            # 3. Validate & send to Arduino
+            # 4. Execute the command for a short burst, then loop back to stop
             if command in ('F', 'B', 'L', 'R', 'S'):
                 print(f"[llm] Decision: {command}")
                 send_command(ser, command)
+                if command != 'S':
+                    time.sleep(MOVE_DURATION)  # Drive for a brief moment
             else:
-                print(f"[llm] Unexpected response '{command}' — sending S (stop)")
-                send_command(ser, 'S')
-
-            time.sleep(LOOP_INTERVAL)
+                print(f"[llm] Unexpected response '{command}' — staying stopped")
 
     except KeyboardInterrupt:
         print("\n[main] Stopping — sending S (stop)")
