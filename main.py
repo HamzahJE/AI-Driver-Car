@@ -5,101 +5,97 @@ import serial
 import threading
 from dotenv import load_dotenv
 
-# Load environment variables once at startup
 project_root = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(project_root, '.env'))
 
-from modules.cam import capture_image
+# Make sure your capture_image function can return an image object or save to a known filepath rapidly
+from modules.cam import capture_image 
 from modules.openai_vision import get_driving_command
 
-# ============================================================================
-# SERIAL CONFIG — adjust port to match your Pi's serial device
-# ============================================================================
-SERIAL_PORT = '/dev/ttyACM0'   # Arduino on Pi
+SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
 
+# Global variable for the async camera thread
+latest_image_ready = False
 
 def open_serial(port=SERIAL_PORT, baud=BAUD_RATE):
-    """Open serial connection to the Arduino."""
     ser = serial.Serial(port, baud, timeout=1)
-    time.sleep(2)  # Wait for Arduino to reset after serial connection
-    ser.reset_input_buffer()  # Flush the "Robot Ready..." startup message
+    time.sleep(2)
+    ser.reset_input_buffer()
     print(f"[serial] Connected to Arduino on {port} @ {baud}")
     return ser
 
-
 def send_goal(ser, goal):
-    """Send a goal direction (F/B/L/R/S) to the Arduino."""
-    ser.reset_input_buffer()  # Clear any queued sensor data before sending
+    ser.reset_input_buffer() 
     ser.write(goal.encode())
     time.sleep(0.05)
     ack = ser.read(1).decode(errors='ignore')
     if ack == 'A':
-        print(f"[arduino] ACK — goal set to '{goal}'")
-    elif ack == 'E':
-        print(f"[arduino] ERROR — unrecognised command '{goal}'")
-    else:
-        print(f"[arduino] No ACK (got '{ack}')")
+        print(f"[arduino] ACK — goal '{goal}' applied")
 
-
-def sensor_logger(ser, stop_event):
-    """Background thread: read and display sensor data from Arduino."""
+def camera_worker(stop_event):
+    """Background thread continuously capturing the latest frame."""
+    global latest_image_ready
+    print("[cam_thread] Starting async camera capture...")
     while not stop_event.is_set():
         try:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode(errors='ignore').strip()
-                if line.startswith('D:'):
-                    # D:front_cm
-                    print(f"[sensor] Front: {line[2:]}cm")
-            else:
-                time.sleep(0.02)
-        except Exception:
-            time.sleep(0.1)
-
+            # Modify this if your function returns an image object instead of saving to disk
+            capture_image() 
+            latest_image_ready = True
+            time.sleep(0.1) # Prevent CPU hogging
+        except Exception as e:
+            print(f"[cam_thread] ERROR: {e}")
+            time.sleep(1)
 
 def main():
-    """Main loop: Arduino drives continuously, Pi sends updated direction goals."""
     ser = open_serial()
 
-    # Start background sensor logging
     stop_event = threading.Event()
-    sensor_thread = threading.Thread(target=sensor_logger, args=(ser, stop_event), daemon=True)
-    sensor_thread.start()
+    
+    # Start Asynchronous Camera Thread
+    cam_thread = threading.Thread(target=camera_worker, args=(stop_event,), daemon=True)
+    cam_thread.start()
 
-    print("[main] Starting AI driving loop  (Ctrl-C to stop)")
-    print("[main] Arduino handles real-time driving. Pi sends direction goals.\n")
-
-    # Start with stop until first LLM decision
+    print("[main] Starting AI driving loop. Arduino handles reflexes, Pi handles strategy.")
     send_goal(ser, 'S')
+
+    last_goal = 'S'
 
     try:
         while True:
-            # 1. Capture image (Arduino keeps driving the current goal)
-            print("[cam] Capturing image...")
+            global latest_image_ready
+            
+            # Wait for the camera thread to have a fresh frame ready
+            if not latest_image_ready:
+                time.sleep(0.05)
+                continue
+                
+            latest_image_ready = False # Consume the frame
+
+            print(f"[llm] Processing frame. Last action was '{last_goal}'...")
+            
+            # Context-Aware Prompting (Short-Term Memory)
+            dynamic_prompt = (
+                f"You are navigating. Your PREVIOUS command was: {last_goal}. "
+                "Maintain this direction unless the path is blocked or a significantly "
+                "better gap has appeared. Look at the entire image. Where is the clearest "
+                "path right now? Respond with EXACTLY ONE letter: F, B, L, R, or S. Avoid getting stuck in loops. If front is blocked, look around in other directions."
+            )
+
             try:
-                capture_image()
+                # Ensure your get_driving_command function accepts the prompt parameter!
+                goal = get_driving_command(dynamic_prompt)
             except Exception as e:
-                print(f"[cam] ERROR: {e} — setting goal to S")
+                print(f"[llm] ERROR: {e}")
                 send_goal(ser, 'S')
-                time.sleep(1)
                 continue
 
-            # 2. Ask LLM for direction (Arduino still driving)
-            print("[llm] Asking for driving command...")
-            try:
-                goal = get_driving_command()
-            except Exception as e:
-                print(f"[llm] ERROR: {e} — setting goal to S")
-                send_goal(ser, 'S')
-                time.sleep(1)
-                continue
-
-            # 3. Update the Arduino's goal direction
             if goal in ('F', 'B', 'L', 'R', 'S'):
                 print(f"[llm] New goal: {goal}")
                 send_goal(ser, goal)
+                if goal != 'S': 
+                    last_goal = goal # Remember what we did for the next loop
             else:
-                print(f"[llm] Unexpected '{goal}' — setting goal to S")
                 send_goal(ser, 'S')
 
     except KeyboardInterrupt:
@@ -108,7 +104,6 @@ def main():
         stop_event.set()
         ser.close()
         sys.exit(0)
-
 
 if __name__ == "__main__":
     main()

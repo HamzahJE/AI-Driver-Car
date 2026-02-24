@@ -1,230 +1,194 @@
 // ============================================================================
-// AI Driver Car — Smart Motor Controller with Front Ultrasonic Sensor
+// AI Driver Car — Smart Motor Controller with I2C LCD & Velocity Persistence
 // ============================================================================
-// The Pi/LLM sends a GOAL direction (F/B/L/R/S). This Arduino uses a front
-// ultrasonic sensor to drive smoothly toward that goal while avoiding
-// head-on collisions. Movement is continuous and reactive.
-// ============================================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Set the LCD address to 0x27 for a 16 chars and 2 line display (sometimes 0x3F)
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
 // --- Motor Pins ---
-const int M1_A = 9;  // Left Motor Pin A
-const int M1_B = 10; // Left Motor Pin B
-const int M2_A = 5;  // Right Motor Pin A
-const int M2_B = 6;  // Right Motor Pin B
+const int M1_A = 9;  
+const int M1_B = 10; 
+const int M2_A = 5;  
+const int M2_B = 6;  
 
-// --- Ultrasonic Sensor Pins (Front only) ---
-const int TRIG_F = 7; // Front sensor trigger
-const int ECHO_F = 8; // Front sensor echo
+// --- Ultrasonic Sensor Pins ---
+const int TRIG_F = 7; 
+const int ECHO_F = 8; 
 
 // --- Tuning Constants ---
-const int STOP_DIST = 10;       // cm — emergency stop if closer
-const int SLOW_DIST = 30;       // cm — start slowing down
-const int BASE_SPEED = 200;     // PWM 0-255 — normal driving speed
-const int MIN_SPEED = 80;       // PWM — slowest we'll go (below this motors stall)
-const int TURN_SPEED = 180;     // PWM — speed during turns
-const int SENSOR_INTERVAL = 50; // ms — how often to read sensor
+const int STOP_DIST = 15;       // cm — increased slightly for safety
+const int SLOW_DIST = 40;       // cm — start slowing down
+const int BASE_SPEED = 200;     // PWM 0-255
+const int MIN_SPEED = 90;       // PWM — slowest we'll go
+const int TURN_SPEED = 180;     
+const int SENSOR_INTERVAL = 50; // ms
 
-// --- State ---
-char currentGoal = 'S'; // Goal direction from LLM (F/B/L/R/S)
+// --- Velocity Persistence Constants ---
+const unsigned long COMMAND_TIMEOUT = 1000;  // ms before slowing down (LLM is thinking)
+const unsigned long EMERGENCY_TIMEOUT = 3000; // ms before full stop (LLM crashed)
+
+// --- State Variables ---
+char currentGoal = 'S'; 
+char lastTurnBias = 'L'; // Remembers last turn direction for smarter evasion
 unsigned long lastSensorRead = 0;
+unsigned long lastCommandTime = 0;
 int distFront = 999;
+const int CLEAR_DIST = 50; // cm — distance considered an "open path"
+// LCD tracking to prevent flickering
+String currentLine1 = "";
+String currentLine2 = "";
 
-// ============================================================================
-// SETUP
-// ============================================================================
-void setup()
-{
+void setup() {
+  delay(2000); 
   Serial.begin(115200);
 
-  // Motor pins
-  pinMode(M1_A, OUTPUT);
-  pinMode(M1_B, OUTPUT);
-  pinMode(M2_A, OUTPUT);
-  pinMode(M2_B, OUTPUT);
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  updateLCD("Robot Booting...", "Awaiting Pi");
 
-  // Sensor pins
-  pinMode(TRIG_F, OUTPUT);
-  pinMode(ECHO_F, INPUT);
+  pinMode(M1_A, OUTPUT); pinMode(M1_B, OUTPUT);
+  pinMode(M2_A, OUTPUT); pinMode(M2_B, OUTPUT);
+  pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
 
   stopMotors();
-  Serial.println("Robot Ready. Front sensor active. Send F, B, L, R, S or T.");
 }
 
-// ============================================================================
-// MAIN LOOP — runs every ~50ms
-// ============================================================================
-void loop()
-{
-  // --- Check for new commands from Pi ---
-  if (Serial.available() > 0)
-  {
+void loop() {
+  // --- 1. Check for new commands from Pi ---
+  if (Serial.available() > 0) {
     char cmd = Serial.read();
-    if (cmd == 'T')
-    {
-      runTestSequence();
-      return;
-    }
-    if (cmd == 'F' || cmd == 'B' || cmd == 'L' || cmd == 'R' || cmd == 'S')
-    {
+    if (cmd == 'F' || cmd == 'B' || cmd == 'L' || cmd == 'R' || cmd == 'S') {
       currentGoal = cmd;
-      Serial.write('A'); // ACK
-    }
-    else
-    {
-      Serial.write('E'); // Unknown command
+      lastCommandTime = millis(); // Reset timeout
+      
+      // Update turn bias for future memory
+      if (cmd == 'L' || cmd == 'R') lastTurnBias = cmd; 
+      
+      Serial.write('A'); // Send ACK back to Pi silently
     }
   }
 
-  // --- Read sensor at regular intervals ---
+  // --- 2. Read Sensor ---
   unsigned long now = millis();
-  if (now - lastSensorRead >= SENSOR_INTERVAL)
-  {
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
     lastSensorRead = now;
     distFront = readDistance(TRIG_F, ECHO_F);
-
-    // Send sensor data to Pi for logging
-    Serial.print("D:");
-    Serial.println(distFront);
   }
 
-  // --- Drive based on goal + sensor feedback ---
-  drive();
-}
+  // --- 3. Velocity Persistence & Safety Timeouts ---
+  unsigned long timeSinceCommand = millis() - lastCommandTime;
+  int currentSpeed = BASE_SPEED;
 
-// ============================================================================
-// SMART DRIVING — goal direction + front sensor safety
-// ============================================================================
-void drive()
-{
-  if (currentGoal == 'S')
-  {
+  if (timeSinceCommand > EMERGENCY_TIMEOUT && currentGoal != 'S') {
+    currentGoal = 'S';
+    updateLCD("ERROR: LLM Lost", "Emergency Stop");
+    stopMotors();
+    return;
+  } else if (timeSinceCommand > COMMAND_TIMEOUT && currentGoal == 'F') {
+    // LLM is taking a while, decelerate gracefully
+    currentSpeed = MIN_SPEED;
+    updateLCD("LLM Thinking...", "Coasting safely");
+  } else {
+    // Normal operation display
+    updateLCD("LLM Goal: " + String(currentGoal), "Dist: " + String(distFront) + "cm");
+  }
+
+  // --- 4. Smart Driving & Evasion Logic ---
+  if (currentGoal == 'S') {
     stopMotors();
     return;
   }
 
-  // --- FORWARD ---
-  if (currentGoal == 'F')
-  {
-    if (distFront <= STOP_DIST)
-    {
-      // Wall right ahead — stop, let LLM re-evaluate
+  if (currentGoal == 'F') {
+    if (distFront <= STOP_DIST) {
+      // BLOCKED: Smart Pivot & Peek
+      updateLCD("BLOCKED!", "Pivoting...");
       stopMotors();
+      delay(100);
+      
+      // Arc backwards based on last known good direction
+      if (lastTurnBias == 'L') {
+        driveMotors(MIN_SPEED, BASE_SPEED, false); // Arc Left Back
+      } else {
+        driveMotors(BASE_SPEED, MIN_SPEED, false); // Arc Right Back
+      }
+      delay(350);
+      
+      stopMotors();
+      currentGoal = 'S'; // Wait for LLM to send new command based on new view
       return;
     }
 
-    // Calculate speed based on front distance (slow down as we approach)
-    int speed = BASE_SPEED;
-    if (distFront < SLOW_DIST)
-    {
-      speed = map(distFront, STOP_DIST, SLOW_DIST, MIN_SPEED, BASE_SPEED);
-      speed = constrain(speed, MIN_SPEED, BASE_SPEED);
+    // Dynamic braking
+    if (distFront < SLOW_DIST) {
+      currentSpeed = map(distFront, STOP_DIST, SLOW_DIST, MIN_SPEED, currentSpeed);
+      currentSpeed = constrain(currentSpeed, MIN_SPEED, BASE_SPEED);
+    }
+    driveMotors(currentSpeed, currentSpeed, true);
+    return;
+  }
+
+  if (currentGoal == 'B') driveMotors(BASE_SPEED, BASE_SPEED, false);
+  // --- TURN LEFT OR RIGHT (Acoustic Seeking) ---
+  if (currentGoal == 'L' || currentGoal == 'R') {
+    
+    // Check if the sensor sees a clear gap while we are turning
+    if (distFront > CLEAR_DIST) {
+      // GAP FOUND! Stop turning and auto-switch to Forward
+      currentGoal = 'F'; 
+      updateLCD("Gap Found!", "Auto-Forward");
+      driveMotors(BASE_SPEED, BASE_SPEED, true);
+      return; 
     }
 
-    driveMotors(speed, speed, true); // true = forward
-    return;
-  }
-
-  // --- BACKWARD ---
-  if (currentGoal == 'B')
-  {
-    driveMotors(BASE_SPEED, BASE_SPEED, false); // false = reverse
-    return;
-  }
-
-  // --- TURN LEFT ---
-  if (currentGoal == 'L')
-  {
-    // Spin left: left motor backward, right motor forward
-    setMotor(M1_A, M1_B, TURN_SPEED, false); // left backward
-    setMotor(M2_A, M2_B, TURN_SPEED, true);  // right forward
-    return;
-  }
-
-  // --- TURN RIGHT ---
-  if (currentGoal == 'R')
-  {
-    // Spin right: left motor forward, right motor backward
-    setMotor(M1_A, M1_B, TURN_SPEED, true);  // left forward
-    setMotor(M2_A, M2_B, TURN_SPEED, false); // right backward
+    // Otherwise, keep turning to look for a gap
+    if (currentGoal == 'L') {
+      setMotor(M1_A, M1_B, TURN_SPEED, false); 
+      setMotor(M2_A, M2_B, TURN_SPEED, true);
+    } else {
+      setMotor(M1_A, M1_B, TURN_SPEED, true); 
+      setMotor(M2_A, M2_B, TURN_SPEED, false);
+    }
     return;
   }
 }
 
-// ============================================================================
-// MOTOR HELPERS
-// ============================================================================
+// --- Helper Functions ---
 
-void setMotor(int pinA, int pinB, int speed, bool forward)
-{
-  if (forward)
-  {
-    analogWrite(pinA, 0);
-    analogWrite(pinB, speed);
-  }
-  else
-  {
-    analogWrite(pinA, speed);
-    analogWrite(pinB, 0);
+void updateLCD(String line1, String line2) {
+  // Only update if text changes to prevent awful screen flickering
+  if (line1 != currentLine1 || line2 != currentLine2) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(line1);
+    lcd.setCursor(0, 1); lcd.print(line2);
+    currentLine1 = line1;
+    currentLine2 = line2;
   }
 }
 
-void driveMotors(int leftSpeed, int rightSpeed, bool forward)
-{
+void setMotor(int pinA, int pinB, int speed, bool forward) {
+  if (forward) { analogWrite(pinA, 0); analogWrite(pinB, speed); }
+  else         { analogWrite(pinA, speed); analogWrite(pinB, 0); }
+}
+
+void driveMotors(int leftSpeed, int rightSpeed, bool forward) {
   setMotor(M1_A, M1_B, leftSpeed, forward);
   setMotor(M2_A, M2_B, rightSpeed, forward);
 }
 
-void stopMotors()
-{
-  analogWrite(M1_A, 0);
-  analogWrite(M1_B, 0);
-  analogWrite(M2_A, 0);
-  analogWrite(M2_B, 0);
+void stopMotors() {
+  analogWrite(M1_A, 0); analogWrite(M1_B, 0);
+  analogWrite(M2_A, 0); analogWrite(M2_B, 0);
 }
 
-// ============================================================================
-// ULTRASONIC SENSOR
-// ============================================================================
-
-int readDistance(int trigPin, int echoPin)
-{
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-
-  long duration = pulseIn(echoPin, HIGH, 25000); // 25ms timeout (~4m max)
-  if (duration == 0)
-    return 999;                // No echo = nothing in range
-  return duration * 0.034 / 2; // Convert to cm
-}
-
-// ============================================================================
-// TEST SEQUENCE — standalone motor test (no LLM needed)
-// ============================================================================
-void runTestSequence()
-{
-  Serial.println("Starting Test Sequence...");
-
-  Serial.print("Front distance: ");
-  Serial.print(readDistance(TRIG_F, ECHO_F));
-  Serial.println(" cm");
-
-  char tests[] = {'F', 'B', 'L', 'R', 'S'};
-  for (int i = 0; i < 5; i++)
-  {
-    currentGoal = tests[i];
-    Serial.print("Testing: ");
-    Serial.println(tests[i]);
-    for (int j = 0; j < 20; j++)
-    { // Run for ~1 second (20 x 50ms)
-      distFront = readDistance(TRIG_F, ECHO_F);
-      drive();
-      delay(SENSOR_INTERVAL);
-    }
-  }
-  stopMotors();
-  currentGoal = 'S';
-  Serial.println("Test Complete.");
+int readDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW); delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10); digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000); 
+  if (duration == 0) return 999;                
+  return duration * 0.034 / 2; 
 }
