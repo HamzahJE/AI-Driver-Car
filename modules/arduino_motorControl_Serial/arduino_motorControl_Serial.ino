@@ -40,6 +40,9 @@ unsigned long lastCommandTime = 0;
 int distFront = 999;
 const int CLEAR_DIST = 90; // cm — distance considered an "open path"
 // LCD tracking to prevent flickering
+unsigned long postTurnStart = 0;     // when the turn-to-forward transition happened
+const unsigned long CORRECTION_MS = 400; // ms to arc away from wall after a turn
+const int CORRECTION_OFFSET = 60;    // PWM reduction on inner motor during correction
 String currentLine1 = "";
 String currentLine2 = "";
 
@@ -143,7 +146,21 @@ void loop() {
         currentSpeed = map(distFront, STOP_DIST, SLOW_DIST, MIN_SPEED, currentSpeed);
         currentSpeed = constrain(currentSpeed, MIN_SPEED, BASE_SPEED);
       }
-      driveMotors(currentSpeed, currentSpeed, true);
+      // Post-turn correction: arc slightly away from the wall we turned from
+      if (postTurnStart > 0 && (millis() - postTurnStart) < CORRECTION_MS) {
+        int innerSpeed = currentSpeed - CORRECTION_OFFSET;
+        innerSpeed = constrain(innerSpeed, MIN_SPEED, currentSpeed);
+        if (lastTurnBias == 'L') {
+          // Turned left, angled toward right wall — arc left to straighten
+          driveMotors(innerSpeed, currentSpeed, true);
+        } else {
+          // Turned right, angled toward left wall — arc right to straighten
+          driveMotors(currentSpeed, innerSpeed, true);
+        }
+      } else {
+        postTurnStart = 0;
+        driveMotors(currentSpeed, currentSpeed, true);
+      }
       return;
     }
   }
@@ -161,9 +178,9 @@ void loop() {
       // GAP FOUND! Stop turning and auto-switch to Forward
       currentGoal = 'F';
       seeking = false;
-      updateLCD("Gap Found!", "Auto-Forward");
-      driveMotors(BASE_SPEED, BASE_SPEED, true);
-      return;
+      postTurnStart = millis(); // start correction arc
+      updateLCD("Gap Found!", "Correcting...");
+      return; // fall through to forward logic next loop
     }
 
     // Otherwise, keep turning to look for a gap

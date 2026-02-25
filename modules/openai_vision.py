@@ -35,7 +35,7 @@ USER_PROMPT = ( "Where is the biggest gap or open path? Respond with one letter:
                )
 
 def get_driving_command(dynamic_prompt, image_path=None):
-    """Send an image to the LLM and return a single driving command letter (F/B/L/R/S).
+    """Send an image to the LLM and return a single driving command letter (F/B/L/R).
 
     Args:
         dynamic_prompt: The text prompt including history/memory.
@@ -89,7 +89,7 @@ def get_driving_command(dynamic_prompt, image_path=None):
         raw = (response.choices[0].message.content or '').strip().upper()
         
         # Safety Net 2: Aggressive output filtering
-        valid_commands = ['F', 'B', 'L', 'R', 'S']
+        valid_commands = ['F', 'B', 'L', 'R']
         for char in raw:
             if char in valid_commands:
                 return char
